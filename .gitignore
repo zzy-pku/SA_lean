@@ -1,0 +1,9 @@
+__pycache__/
+*.py[cod]
+*.olean
+*.ilean
+.lake/
+.venv/
+sa-output/
+experiments/runs/
+tmp*/

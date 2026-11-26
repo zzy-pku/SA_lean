@@ -1,4 +1,4 @@
-"""Generate Lean predicate goals and optionally submit them to Lean-blaster.
+"""Generate Lean function goals and optionally submit them to Lean-blaster.
 
 This is an experimental adapter, not a verified Lean-to-SMT translator.
 """
@@ -34,85 +34,11 @@ def valid_name(value: str) -> str:
     return value
 
 
-def candidate_values(output: str, binders: list[dict]) -> list[dict] | None:
-    """Decode only simple values; symbolic/missing values get a tested default.
-
-    The resulting assignment is never trusted until Lean checks the instance.
-    """
-    if len({b["name"] for b in binders}) != len(binders):
-        return None
-    raw = dict(re.findall(r" - ([^\s:]+):\s*([^\r\n]+)", output))
-    values = []
-    for binder in binders:
-        name, ty = binder["name"], binder["type"]
-        value = raw.get(name, "").strip()
-        defaulted = False
-        if ty in ("Int", "Nat"):
-            match = re.fullmatch(r"\(-\s+(\d+)\)", value)
-            if match:
-                value = "-" + match.group(1)
-            if not re.fullmatch(r"-?\d+", value):
-                value = "0"
-                defaulted = True
-            if ty == "Nat" and value.startswith("-"):
-                return None
-            literal = f"({value} : {ty})"
-        elif ty == "Bool":
-            if value not in ("true", "false"):
-                value = "false"
-                defaulted = True
-            literal = value
-        else:
-            return None
-        values.append({"name": name, "type": ty, "value": value, "literal": literal,
-                       "defaulted": defaulted})
-    return values
-
-
-def replay_counterexample(lean: str, project: Path, module: str, goal: dict,
-                          output: str, env: dict[str, str], out: Path, i: int,
-                          timeout: int) -> dict | None:
-    values = candidate_values(output, goal["binders"])
-    if values is None:
-        return None
-    args = " ".join(v["literal"] for v in values)
-    instance = f"h {args}" if args else "h"
-    dependencies = [name for name in goal.get("unfold_dependencies", []) if IDENT.fullmatch(name)]
-    unfold = "".join(f"  try unfold {name} at k\n" for name in dependencies)
-    source = out / f"witness-{i:03d}.lean"
-    source.write_text(f"import {module}\n\nexample : ¬ ({goal['goal']}) := by\n"
-                      f"  intro h\n  have k := {instance}\n"
-                      f"  unfold {goal['declaration']} at k\n{unfold}  revert k\n  decide\n", encoding="utf-8")
-    try:
-        check = run([lean, str(source)], cwd=project, env=env, timeout=timeout)
-    except RuntimeError as exc:
-        (out / f"witness-{i:03d}.log").write_text(str(exc), encoding="utf-8")
-        return None
-    (out / f"witness-{i:03d}.log").write_text(check.stdout + check.stderr, encoding="utf-8")
-    if check.returncode != 0:
-        return None
-    return {"values": values, "validation": "lean_checked", "source": source.name,
-            "log": f"witness-{i:03d}.log"}
-
-
-def validate_valid_goal(lean: str, project: Path, module: str, goal: dict,
-                        env: dict[str, str], out: Path, i: int, timeout: int) -> dict | None:
-    """Independently try kernel-checked Lean proof; failure is not refutation."""
-    dependencies = [name for name in goal.get("unfold_dependencies", []) if IDENT.fullmatch(name)]
-    unfold = "".join(f"  try unfold {name}\n" for name in dependencies)
-    source = out / f"validate-{i:03d}.lean"
-    source.write_text(f"import {module}\n\nexample : {goal['goal']} := by\n"
-                      f"  intros\n  unfold {goal['declaration']}\n{unfold}"
-                      "  first | omega | (left; omega)\n", encoding="utf-8")
-    try:
-        check = run([lean, str(source)], cwd=project, env=env, timeout=timeout)
-    except RuntimeError as exc:
-        (out / f"validate-{i:03d}.log").write_text(str(exc), encoding="utf-8")
-        return None
-    (out / f"validate-{i:03d}.log").write_text(check.stdout + check.stderr, encoding="utf-8")
-    if check.returncode != 0 or "declaration uses 'sorry'" in check.stdout + check.stderr:
-        return None
-    return {"validation": "lean_checked", "source": source.name, "log": f"validate-{i:03d}.log"}
+def universe_declaration(goal: dict) -> str:
+    levels = goal.get("universe_parameters", [])
+    if not all(IDENT.fullmatch(level) for level in levels):
+        raise RuntimeError("unsupported universe parameter name in generated goal")
+    return f"universe {' '.join(levels)}\n\n" if levels else ""
 
 
 def main() -> int:
@@ -179,7 +105,7 @@ def main() -> int:
         raise RuntimeError("goal generation failed; see extract.log")
     goals = [json.loads(line.removeprefix("SA_GOAL:")) for line in extracted.stdout.splitlines()
              if line.startswith("SA_GOAL:")]
-    if len(goals) < 2:
+    if not goals:
         raise RuntimeError("goal generator returned incomplete output")
     (out / "goals.json").write_text(json.dumps(goals, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     results = []
@@ -187,7 +113,7 @@ def main() -> int:
         result = {**goal, "backend": "lean-blaster", "status": "not_run", "reason": "no compiled Lean-blaster specified"}
         if args.blaster_path:
             source = out / f"query-{i:03d}.lean"
-            source.write_text(f"import Blaster\nimport {args.module}\n\n#blaster (timeout: {args.timeout}) (dump-smt-lib: 1) [{goal['goal']}]\n", encoding="utf-8")
+            source.write_text(f"import Blaster\nimport {args.module}\n\n{universe_declaration(goal)}#blaster (timeout: {args.timeout}) (dump-smt-lib: 1) [{goal['goal']}]\n", encoding="utf-8")
             try:
                 proc = run([lean, str(source)], cwd=project, env=env, timeout=args.timeout + 10)
                 output = proc.stdout + proc.stderr
@@ -205,20 +131,9 @@ def main() -> int:
                 if "Undetermined" in output:
                     result.update(status="unknown", backend_verdict="undetermined", reason="Lean-blaster reported undetermined")
                 elif "Falsified" in output:
-                    witness = replay_counterexample(lean, project, args.module, goal, output, env, out, i, args.timeout)
-                    if witness is not None:
-                        result.update(status="refuted", backend_verdict="falsified", witness=witness,
-                                      reason="Lean checked a concrete counterexample to the generated goal")
-                    else:
-                        result.update(status="candidate", backend_verdict="falsified",
-                                      reason="Lean-blaster reported a counterexample; concrete replay did not succeed")
+                    result.update(status="falsified", backend_verdict="falsified", reason="Lean-blaster reported falsified; no independent validation")
                 elif "Unexpected Valid" in output or ("Valid" in output and proc.returncode == 0):
-                    checked = validate_valid_goal(lean, project, args.module, goal, env, out, i, args.timeout)
-                    if checked is None:
-                        result.update(status="candidate", backend_verdict="valid", reason="Lean-blaster reports valid; independent Lean check did not succeed")
-                    else:
-                        result.update(status="confirmed", backend_verdict="valid", evidence=checked,
-                                      reason="independent Lean tactic closed the generated goal")
+                    result.update(status="valid", backend_verdict="valid", reason="Lean-blaster reported valid; no independent validation")
                 else:
                     result.update(status="error", reason="unrecognized Lean-blaster output or execution failure")
                 result["exit_code"] = proc.returncode

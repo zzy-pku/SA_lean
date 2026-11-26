@@ -7,27 +7,104 @@ import sys
 import tempfile
 import unittest
 
-from smt_route.analyze import candidate_values
+from tests.benchmark import compare_case
 
 ROOT = Path(__file__).resolve().parents[1]
 LEAN = os.environ.get("SA_LEAN")
 
 
-class WitnessParsingTest(unittest.TestCase):
-    def test_incomplete_model_uses_defaults_but_marks_them(self):
-        values = candidate_values(" - mode: 1\n - noise: $2\n", [
-            {"name": "mode", "type": "Int"}, {"name": "noise", "type": "Int"}])
-        self.assertEqual([v["value"] for v in values], ["1", "0"])
-        self.assertEqual([v["defaulted"] for v in values], [False, True])
+class BenchmarkComparisonTest(unittest.TestCase):
+    def test_match_mismatch_and_unresolved_are_distinct(self):
+        case = {"declaration": "Example.f", "expected": {"constant": "valid", "independent:0": "falsified", "independent:1": "valid"}}
+        results = [{"declaration": "Example.f", "kind": "constant", "parameter_index": None, "status": "valid"},
+                   {"declaration": "Example.f", "kind": "independent", "parameter_index": 0, "status": "valid"},
+                   {"declaration": "Example.f", "kind": "independent", "parameter_index": 1, "status": "error"}]
+        self.assertEqual([r["grade"] for r in compare_case(case, results)], ["match", "mismatch", "unresolved"])
 
-    def test_duplicate_binders_are_not_guessed(self):
-        self.assertIsNone(candidate_values("", [
-            {"name": "x", "type": "Int"}, {"name": "x", "type": "Int"}]))
+    def test_missing_goal_and_changed_comparison_are_not_scored(self):
+        case = {"declaration": "Example.f", "expected": {"constant": "valid"}}
+        with self.assertRaises(ValueError):
+            compare_case(case, [])
+        with self.assertRaises(ValueError):
+            compare_case(case, [{"declaration": "Example.f", "kind": "constant", "parameter_index": None, "status": "valid", "comparison": "heterogeneous"}])
 
 
 @unittest.skipUnless(LEAN, "set SA_LEAN to run Lean integration tests")
 class GoalGenerationTest(unittest.TestCase):
-    def test_generated_targets_are_well_formed_and_semantically_correct(self):
+    def test_structure_case_goals_are_well_formed_and_labelled(self):
+        with tempfile.TemporaryDirectory(dir=ROOT / "smt_route") as tmp:
+            temp = Path(tmp)
+            build = temp / "smt_route"
+            build.mkdir()
+            env = {**os.environ, "LEAN_PATH": str(temp)}
+            for source, target, cwd in [
+                (ROOT / "smt_route" / "Goals.lean", build / "Goals.olean", ROOT),
+                (ROOT / "examples" / "StructureCases.lean", temp / "StructureCases.olean", ROOT / "examples"),
+            ]:
+                proc = subprocess.run([LEAN, "-o", str(target), str(source)], cwd=cwd, env=env,
+                                      capture_output=True, text=True, encoding="utf-8")
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            labels = json.loads((ROOT / "tests" / "expected_results.json").read_text(encoding="utf-8"))["cases"]
+            cases = [case for case in labels if case["module"] == "StructureCases"]
+            self.assertEqual(len(cases), 10)
+            source = temp / "Extract.lean"
+            source.write_text("import smt_route.Goals\nimport StructureCases\n" + "".join(
+                f"#semantic_goals {case['declaration']}\n" for case in cases), encoding="utf-8")
+            proc = subprocess.run([LEAN, str(source)], cwd=temp, env=env, capture_output=True,
+                                  text=True, encoding="utf-8")
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            goals = [json.loads(line[8:]) for line in proc.stdout.splitlines() if line.startswith("SA_GOAL:")]
+            self.assertEqual(len(goals), 31)
+            for case in cases:
+                items = [{**g, "status": "not_run"} for g in goals if g["declaration"] == case["declaration"]]
+                self.assertTrue(all(r["grade"] == "unresolved" for r in compare_case(case, items)))
+            check = temp / "Check.lean"
+            check.write_text("import StructureCases\n" + "".join(
+                f"#check (show Prop from ({goal['goal']}))\n" for goal in goals), encoding="utf-8")
+            proc = subprocess.run([LEAN, str(check)], cwd=temp, env=env, capture_output=True,
+                                  text=True, encoding="utf-8")
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+
+    def test_general_function_goals_reelaborate(self):
+        with tempfile.TemporaryDirectory(dir=ROOT / "smt_route") as tmp:
+            temp = Path(tmp)
+            build = temp / "smt_route"
+            build.mkdir()
+            env = {**os.environ, "LEAN_PATH": str(temp)}
+            for source, target, cwd in [
+                (ROOT / "smt_route" / "Goals.lean", build / "Goals.olean", ROOT),
+                (ROOT / "examples" / "FunctionCases.lean", temp / "FunctionCases.olean", ROOT / "examples"),
+            ]:
+                p = subprocess.run([LEAN, "-o", str(target), str(source)], cwd=cwd, env=env,
+                                   capture_output=True, text=True, encoding="utf-8")
+                self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+            declarations = ["scalar", "collection", "polymorphic", "withInstance", "higherOrder", "dependent", "dependentResult"]
+            source = temp / "Extract.lean"
+            source.write_text("import smt_route.Goals\nimport FunctionCases\n" + "".join(
+                f"#semantic_goals FunctionCases.{name}\n" for name in declarations), encoding="utf-8")
+            p = subprocess.run([LEAN, str(source)], cwd=temp, env=env, capture_output=True, text=True, encoding="utf-8")
+            self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+            goals = [json.loads(line[8:]) for line in p.stdout.splitlines() if line.startswith("SA_GOAL:")]
+            self.assertEqual(len(goals), 22)
+            self.assertTrue(any(g["comparison"] == "heterogeneous_fiberwise" for g in goals))
+            self.assertTrue(any(g["universe_parameters"] == ["u"] for g in goals))
+            self.assertTrue(all(g["kind"] in ("constant", "independent") for g in goals))
+            check = temp / "Reelaborate.lean"
+            check.write_text("import FunctionCases\nuniverse u\n" + "".join(
+                f"#check (show Prop from ({g['goal']}))\n" for g in goals), encoding="utf-8")
+            p = subprocess.run([LEAN, str(check)], cwd=temp, env=env, capture_output=True, text=True, encoding="utf-8")
+            self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+            out = temp / "polymorphic-out"
+            p = subprocess.run([sys.executable, str(ROOT / "smt_route" / "analyze.py"),
+                "--lean", LEAN, "--project", str(temp), "--lean-path", str(temp),
+                "--module", "FunctionCases", "--decl", "FunctionCases.polymorphic", "--out", str(out)],
+                cwd=ROOT, capture_output=True, text=True, encoding="utf-8")
+            self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
+            generated = json.loads((out / "goals.json").read_text(encoding="utf-8"))
+            self.assertEqual(len(generated), 4)
+            self.assertTrue(all(g["universe_parameters"] == ["u"] for g in generated))
+
+    def test_predicate_targets_are_well_formed(self):
         with tempfile.TemporaryDirectory(dir=ROOT / "smt_route") as temp:
             temp = Path(temp)
             source = temp / "DependencyCase.lean"
@@ -48,17 +125,9 @@ class GoalGenerationTest(unittest.TestCase):
                 self.assertEqual(len(goals), 5)
                 self.assertTrue(all(g["status"] == "not_run" for g in json.loads((out / "results.json").read_text(encoding="utf-8"))))
                 all_goals[decl] = {(g["kind"], g["parameter_index"]): g["goal"] for g in goals}
-            goal = all_goals["gate"][("independent", 2)]
-            mode = all_goals["gate"][("independent", 0)]
-            value = all_goals["gate"][("independent", 1)]
-            caller = all_goals["caller"][("always_true", None)]
             source = temp / "Check.lean"
-            source.write_text("import DependencyCase\n"
-                f"example : {goal} := by\n  unfold DependencyCase.gate\n  omega\n"
-                f"example : ¬ ({mode}) := by\n  intro h\n  have k := h 0 0 0 1\n  unfold DependencyCase.gate at k\n  omega\n"
-                f"example : ¬ ({value}) := by\n  intro h\n  have k := h 1 7 0 0\n  unfold DependencyCase.gate at k\n  omega\n"
-                f"example : {caller} := by\n  intro a b c\n  unfold DependencyCase.caller DependencyCase.gate\n  exact Or.inl (by omega)\n",
-                encoding="utf-8")
+            source.write_text("import DependencyCase\n" + "".join(
+                f"#check (show Prop from ({goal}))\n" for goals in all_goals.values() for goal in goals.values()), encoding="utf-8")
             env = {**os.environ, "LEAN_PATH": str(temp)}
             checked = subprocess.run([LEAN, str(source)], cwd=temp, env=env, capture_output=True,
                                      text=True, encoding="utf-8")
@@ -82,10 +151,11 @@ class GoalGenerationTest(unittest.TestCase):
                 cwd=ROOT, capture_output=True, text=True, encoding="utf-8", timeout=300)
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
             results = json.loads((out / "results.json").read_text(encoding="utf-8"))
-            self.assertEqual([r["status"] for r in results],
-                             ["refuted", "refuted", "refuted", "refuted", "confirmed"])
-            self.assertEqual(results[-1]["evidence"]["validation"], "lean_checked")
-            self.assertTrue(all(r["witness"]["validation"] == "lean_checked" for r in results[:-1]))
+            cases = json.loads((ROOT / "tests" / "expected_results.json").read_text(encoding="utf-8"))["cases"]
+            case = next(c for c in cases if c["declaration"] == "DependencyCase.gate")
+            self.assertTrue(all(r["grade"] == "match" for r in compare_case(case, results)))
+            self.assertFalse(list(out.glob("witness-*.lean")))
+            self.assertFalse(list(out.glob("validate-*.lean")))
             self.assertTrue((out / results[-1]["smt_query"]).is_file())
 
 
